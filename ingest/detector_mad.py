@@ -61,7 +61,11 @@ def add_mad_anomalies(
     group_cols: Tuple[str, ...] = ("service", "endpoint"),
     ts_col: str = "bucket_ts",
     metric_col: str = "p95_latency_ms",
-    threshold: float = 3.5
+    threshold: float = 3.5,
+    min_points: int = 20,
+    warmup_points: int = 15,
+    min_req_count: int = 20,
+    req_col: str = "req_count"
 ) -> pd.DataFrame:
     """
     Add MAD-based anomaly detection columns to a DataFrame.
@@ -82,6 +86,22 @@ def add_mad_anomalies(
         Metric column to analyze (default: "p95_latency_ms").
     threshold : float, optional
         MAD z-score threshold for anomaly detection (default: 3.5).
+    min_points : int, optional
+        Minimum number of data points required in a group to flag any anomalies.
+        Groups with fewer points will have all rows set to is_anomaly=False.
+        This prevents false positives from small sample sizes (default: 20).
+    warmup_points : int, optional
+        Number of initial rows per group to skip for anomaly detection.
+        These "warmup" rows allow the MAD baseline to stabilize before
+        flagging anomalies. mad_z is still computed but is_anomaly=False
+        for these rows (default: 15).
+    min_req_count : int, optional
+        Minimum request count required to flag a row as anomalous.
+        Rows with low traffic are unreliable for anomaly detection due to
+        high variance from small sample sizes (default: 20).
+    req_col : str, optional
+        Column name containing request counts (default: "req_count").
+        If this column doesn't exist, the min_req_count guardrail is skipped.
     
     Returns
     -------
@@ -97,6 +117,14 @@ def add_mad_anomalies(
     - Info: abs(mad_z) <= threshold
     - Warning: abs(mad_z) > threshold
     - Critical: abs(mad_z) > threshold AND error_rate >= 0.05 (if error_rate exists)
+    
+    Production Guardrails (to reduce false positives):
+    1. **min_points**: Groups with < min_points rows never flag anomalies.
+       Rationale: MAD requires sufficient data for a reliable baseline.
+    2. **warmup_points**: First warmup_points rows per group are never flagged.
+       Rationale: Initial data points lack historical context for comparison.
+    3. **min_req_count**: Rows with req_col < min_req_count are never flagged.
+       Rationale: Low-traffic periods have high metric variance (noise).
     
     Examples
     --------
@@ -125,24 +153,50 @@ def add_mad_anomalies(
     # Check if error_rate column exists
     has_error_rate = 'error_rate' in result.columns
     
+    # Check if req_col exists for min_req_count guardrail
+    has_req_col = req_col in result.columns
+    
     # Compute MAD scores for each group
     for group_values, group_df in result.groupby(list(group_cols)):
         indices = group_df.index
         values = group_df[metric_col].values
+        group_size = len(indices)
         
         # Compute MAD scores for this group
         scores = mad_scores(values)
         result.loc[indices, 'mad_z'] = scores
         
+        # Guardrail 1: Skip anomaly flagging if group has too few points
+        if group_size < min_points:
+            # Leave is_anomaly=False, severity='Info' for entire group
+            continue
+        
         # Flag anomalies based on threshold
         is_anomalous = np.abs(scores) > threshold
-        result.loc[indices, 'is_anomaly'] = is_anomalous
         
-        # Assign severity levels
-        for idx, is_anom, score in zip(indices, is_anomalous, scores):
+        # Convert indices to list for positional access
+        indices_list = indices.tolist()
+        
+        # Assign anomaly flags and severity levels
+        for i, (idx, is_anom, score) in enumerate(zip(indices_list, is_anomalous, scores)):
+            # Guardrail 2: Skip warmup period (first warmup_points rows)
+            if i < warmup_points:
+                result.loc[idx, 'is_anomaly'] = False
+                result.loc[idx, 'severity'] = 'Info'
+                continue
+            
+            # Guardrail 3: Skip rows with low request count
+            if has_req_col and result.loc[idx, req_col] < min_req_count:
+                result.loc[idx, 'is_anomaly'] = False
+                result.loc[idx, 'severity'] = 'Info'
+                continue
+            
+            # Apply standard anomaly detection logic
             if not is_anom:
+                result.loc[idx, 'is_anomaly'] = False
                 result.loc[idx, 'severity'] = 'Info'
             else:
+                result.loc[idx, 'is_anomaly'] = True
                 # Start with Warning
                 severity = 'Warning'
                 

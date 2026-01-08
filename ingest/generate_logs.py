@@ -26,6 +26,7 @@ Future Implementation:
 """
 
 import os
+import json
 import random
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -35,6 +36,10 @@ import uuid
 # =============================================================================
 # CONFIGURATION PARAMETERS
 # =============================================================================
+
+# Deterministic mode for demos
+SEED = 42
+DEMO_MODE = True
 
 # Number of log entries to generate
 N_ROWS = 10000
@@ -49,11 +54,12 @@ INCIDENT_SERVICE = "payments"
 INCIDENT_ENDPOINT = "/pay"
 
 # Random seed for reproducibility (set to None for random behavior)
-RANDOM_SEED = 42
+RANDOM_SEED = SEED if DEMO_MODE else None
 
 # Output configuration
 OUTPUT_DIR = "data"
 OUTPUT_FILE = "raw_logs.csv"
+INCIDENT_META_FILE = "incident_meta.json"
 
 # =============================================================================
 # MICROSERVICE CONFIGURATION
@@ -359,13 +365,46 @@ def print_summary(
 # MAIN EXECUTION
 # =============================================================================
 
+def write_incident_meta(
+    incident_start: datetime,
+    incident_end: datetime,
+    output_path: str
+) -> None:
+    """
+    Write incident metadata to JSON file.
+    
+    Parameters
+    ----------
+    incident_start : datetime
+        Incident start time
+    incident_end : datetime
+        Incident end time
+    output_path : str
+        Path to output JSON file
+    """
+    meta = {
+        "incident_service": INCIDENT_SERVICE,
+        "incident_endpoint": INCIDENT_ENDPOINT,
+        "incident_start_ts": incident_start.isoformat(),
+        "incident_end_ts": incident_end.isoformat(),
+        "seed": SEED,
+        "rows": N_ROWS
+    }
+    
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, "w") as f:
+        json.dump(meta, f, indent=2)
+
+
 def main():
     """Main entry point for log generation."""
-    # Set random seed if specified
+    # Set random seed if specified (seeds both random and uuid for determinism)
     if RANDOM_SEED is not None:
         random.seed(RANDOM_SEED)
     
     print("Generating microservice logs...")
+    if DEMO_MODE:
+        print(f"[DEMO_MODE] Using seed: {SEED}")
     
     # Generate logs
     logs, incident_start, incident_end = generate_logs(
@@ -381,8 +420,18 @@ def main():
     output_path = os.path.join(OUTPUT_DIR, OUTPUT_FILE)
     write_logs_to_csv(logs, output_path)
     
+    # Write incident metadata JSON
+    meta_path = os.path.join(OUTPUT_DIR, INCIDENT_META_FILE)
+    write_incident_meta(incident_start, incident_end, meta_path)
+    
     # Print summary
     print_summary(logs, incident_start, incident_end, output_path)
+    
+    # Print output paths
+    print()
+    print("OUTPUT FILES:")
+    print(f"  Logs: {output_path}")
+    print(f"  Incident metadata: {meta_path}")
 
 
 if __name__ == "__main__":

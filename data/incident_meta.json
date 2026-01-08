@@ -1,0 +1,8 @@
+{
+  "incident_service": "payments",
+  "incident_endpoint": "/pay",
+  "incident_start_ts": "2026-01-06T19:26:56.346467",
+  "incident_end_ts": "2026-01-06T19:34:56.346467",
+  "seed": 42,
+  "rows": 10000
+}

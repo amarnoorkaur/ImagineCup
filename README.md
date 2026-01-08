@@ -1,235 +1,455 @@
-# Microservice Anomaly Detection (MAD)
+# 🎯 Microservice Anomaly Detection (MAD)
 
-Real-time anomaly detection for microservices using Median Absolute Deviation (MAD) - no training required.
+> **Imagine Cup 2026 Submission**  
+> Training-free, real-time anomaly detection for microservices using statistical methods.
 
-## Overview
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-green.svg)](https://fastapi.tiangolo.com/)
+[![Streamlit](https://img.shields.io/badge/Streamlit-1.28+-red.svg)](https://streamlit.io/)
 
-This project demonstrates training-free anomaly detection for microservice APIs using statistical methods. It generates synthetic logs, detects anomalies using MAD (Median Absolute Deviation), and provides both a REST API and interactive dashboard for analysis.
+---
 
-## Features
+## 📋 Table of Contents
 
-- 🔍 **Training-free anomaly detection** using MAD statistical method
-- 📊 **Synthetic log generation** with realistic traffic patterns and incident injection
-- 🚀 **FastAPI backend** for querying metrics, anomalies, and incidents
-- 📈 **Streamlit dashboard** for interactive visualization
-- ⚡ **Real-time analysis** with per-minute feature aggregation
+- [Problem](#-problem)
+- [Solution Overview](#-solution-overview)
+- [Data Flow](#-data-flow)
+- [Quick Start](#-quick-start)
+- [Demo Script](#-demo-script)
+- [API Reference](#-api-reference)
+- [Evaluation](#-evaluation)
+- [Future Work](#-future-work)
 
-## Project Structure
+---
+
+## 🔴 Problem
+
+**Microservice architectures are hard to monitor.**
+
+Modern applications consist of dozens of interconnected services. When something goes wrong:
+- 🕐 **Detection is slow** — Teams rely on user complaints or manual dashboard watching
+- 🔍 **Root cause is unclear** — Which service caused the cascade failure?
+- 📊 **ML solutions need training data** — New services have no historical baseline
+- 💰 **Downtime is expensive** — Every minute of outage costs revenue and reputation
+
+**We need anomaly detection that works immediately, without training.**
+
+---
+
+## ✅ Solution Overview
+
+**MAD (Median Absolute Deviation)** — A robust statistical approach that detects anomalies in real-time without requiring any training data.
+
+### Core Components
+
+| Component | Description |
+|-----------|-------------|
+| **🔍 MAD Detector** | Statistical anomaly scoring using modified z-scores |
+| **🚨 Incident Grouping** | Clusters consecutive anomalies into actionable incidents |
+| **🎯 Culprit Finder** | Ranks service/endpoints by severity to identify root cause |
+| **💡 Explanation Engine** | Generates human-readable incident explanations |
+
+### How MAD Works
 
 ```
-microservice-anomaly-ai/
+Modified Z-Score = 0.6745 × (value - median) / MAD
+```
+
+- **Threshold**: |z-score| > 3.5 → Anomaly
+- **Why MAD?** Robust to outliers (unlike standard deviation)
+- **No training**: Works on first data point
+
+### Severity Classification
+
+| Severity | Condition | Action |
+|----------|-----------|--------|
+| 🟢 **Info** | Normal behavior | None |
+| 🟡 **Warning** | Latency spike (z > 3.5) | Monitor |
+| 🔴 **Critical** | Spike + Error rate ≥ 5% | Alert |
+
+### Production Guardrails
+
+To reduce false positives, we implement:
+- **Warmup Period**: First 15 minutes per service ignored
+- **Minimum Data Points**: Need 20+ rows before flagging
+- **Traffic Threshold**: Low-traffic periods (< 20 req/min) skipped
+
+---
+
+## 🔄 Data Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        DATA FLOW DIAGRAM                             │
+└─────────────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────┐
+  │  Microservices   │     (auth, catalog, checkout, payments)
+  │    Log Data      │
+  └────────┬─────────┘
+           │
+           ▼
+  ┌──────────────────┐     generate_logs.py
+  │  Raw Logs CSV    │───► 10,000 entries, 2-hour window
+  │  + Incident Meta │     Injected incident: payments:/pay
+  └────────┬─────────┘
+           │
+           ▼
+  ┌──────────────────┐     feature_build.py
+  │  Feature Engine  │───► 1-minute aggregation
+  │  (Per-Minute)    │     req_count, error_rate, p95_latency
+  └────────┬─────────┘
+           │
+           ▼
+  ┌──────────────────┐     detector_mad.py
+  │   MAD Detector   │───► mad_z scores, is_anomaly, severity
+  │   + Guardrails   │     Warmup, min_points, min_req_count
+  └────────┬─────────┘
+           │
+           ├─────────────────┬─────────────────┐
+           ▼                 ▼                 ▼
+  ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
+  │   REST API   │   │  Dashboard   │   │  Evaluation  │
+  │   (FastAPI)  │   │  (Streamlit) │   │   Metrics    │
+  └──────────────┘   └──────────────┘   └──────────────┘
+           │                 │
+           ▼                 ▼
+  ┌──────────────┐   ┌──────────────┐
+  │   /culprit   │   │   Culprit    │
+  │   /explain   │   │   Analysis   │
+  └──────────────┘   └──────────────┘
+```
+
+---
+
+## 🚀 Quick Start
+
+### Prerequisites
+
+- Python 3.9+
+- pip
+
+### One-Command Demo
+
+```powershell
+# Clone and setup
+git clone https://github.com/amarnoorkaur/ImagineCup.git
+cd ImagineCup
+
+# Create virtual environment
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Run complete demo pipeline
+python run_demo.py
+```
+
+### Manual Step-by-Step
+
+```powershell
+# 1. Generate synthetic logs with injected incident
+python -m ingest.generate_logs
+
+# 2. Build features and detect anomalies
+python -m ingest.feature_build
+
+# 3. Run evaluation metrics
+python evaluate.py
+
+# 4. Start API (Terminal 1)
+uvicorn backend_api.main:app --reload
+
+# 5. Start Dashboard (Terminal 2)
+streamlit run dashboard/app.py
+```
+
+### Output Files
+
+| File | Description |
+|------|-------------|
+| `data/raw_logs.csv` | 10,000 synthetic log entries |
+| `data/incident_meta.json` | Ground truth incident info |
+| `data/features_1min.csv` | Per-minute aggregated features |
+| `data/scored_1min.csv` | Features + anomaly scores |
+| `data/eval_report.json` | Evaluation metrics |
+
+---
+
+## 🎬 Demo Script
+
+> **Total Time: ~5 minutes**
+
+### Act 1: The Problem (30 seconds)
+
+*"Imagine you're running an e-commerce platform with 4 microservices. At 10:45 AM, your payments service starts failing. How quickly can you detect and identify the issue?"*
+
+### Act 2: Generate Data (1 minute)
+
+```powershell
+python run_demo.py
+```
+
+**Show console output:**
+- ✅ 10,000 logs generated
+- ✅ Incident injected: `payments:/pay` (minute 45-53)
+- ✅ Anomalies detected with MAD
+- ✅ Evaluation: Precision, Recall, Detection Delay
+
+### Act 3: Dashboard Demo (2 minutes)
+
+```powershell
+streamlit run dashboard/app.py
+```
+
+**Click sequence:**
+
+1. **🎯 Culprit Analysis Section**
+   - Point out: Top culprit identified as `payments:/pay`
+   - Show: Peak MAD z-score, severity, error rate
+
+2. **📈 P95 Latency Chart**
+   - Point out: Visible spike around minute 45
+
+3. **🔍 Filters → Service: payments**
+   - Show: Anomalies isolated to payments service
+
+4. **🚨 Incident Summary**
+   - Show: Grouped incident with start/end times
+
+5. **💡 Incident Explanation**
+   - Select incident from dropdown
+   - Click "Generate Explanation"
+   - Show: Why flagged, impact, likely causes, recommended actions
+
+### Act 4: API Demo (1 minute)
+
+Open browser to: `http://localhost:8000/docs`
+
+**Live API calls:**
+
+```
+GET /culprit?minutes=15
+```
+→ Returns top culprit with ranking
+
+```
+GET /explain_incident?service=payments&endpoint=/pay&start_ts=...&end_ts=...
+```
+→ Returns structured explanation
+
+### Act 5: Evaluation (30 seconds)
+
+```powershell
+python evaluate.py
+```
+
+**Show metrics:**
+- True Positives: 8
+- False Positives: ~2
+- Detection Delay: < 1 minute
+- Precision: ~80%
+
+*"We detected the incident within 1 minute with 80% precision — no training required."*
+
+---
+
+## 📡 API Reference
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/health` | GET | Health check |
+| `/metrics` | GET | Query raw metrics |
+| `/anomalies` | GET | Query detected anomalies |
+| `/incidents` | GET | Query grouped incidents |
+| `/culprit` | GET | Find top culprit service/endpoint |
+| `/explain_incident` | GET | Generate incident explanation |
+
+### Example: Get Top Culprit
+
+```bash
+curl "http://localhost:8000/culprit?minutes=15&top_k=3"
+```
+
+**Response:**
+```json
+{
+  "window_minutes": 15,
+  "total_anomalies": 8,
+  "culprit": {
+    "service": "payments",
+    "endpoint": "/pay",
+    "peak_abs_mad": 12.45,
+    "peak_severity": "Critical",
+    "peak_error_rate": 0.25
+  },
+  "top": [...]
+}
+```
+
+### Example: Explain Incident
+
+```bash
+curl "http://localhost:8000/explain_incident?service=payments&endpoint=/pay&start_ts=2026-01-06T10:45:00&end_ts=2026-01-06T10:53:00"
+```
+
+**Response:**
+```json
+{
+  "summary": "Critical incident on payments:/pay...",
+  "why_flagged": ["P95 latency spiked to 4500ms", "MAD z-score of 12.5 exceeded threshold"],
+  "impact": ["Users experiencing failed requests", "SLO may be breached"],
+  "likely_causes": ["Downstream service failure", "Database issues"],
+  "recommended_actions": ["Check service logs immediately", "Verify dependencies"],
+  "confidence": "High"
+}
+```
+
+---
+
+## 📊 Evaluation
+
+We evaluate against injected ground truth incidents.
+
+### Metrics Computed
+
+| Metric | Formula | Description |
+|--------|---------|-------------|
+| **True Positives (TP)** | Anomalies inside incident window | Correctly detected |
+| **False Positives (FP)** | Anomalies outside incident window | False alarms |
+| **Detection Delay** | First TP timestamp - Incident start | Time to detect |
+| **Precision Proxy** | TP / (TP + FP) | Accuracy of alerts |
+| **Recall Proxy** | TP / Expected rows | Coverage of incident |
+
+### Sample Results
+
+```
+======================================================================
+ANOMALY DETECTION EVALUATION REPORT
+======================================================================
+
+📋 GROUND TRUTH:
+   Service:    payments
+   Endpoint:   /pay
+   Duration:   8 minutes
+
+📊 METRICS:
+   True Positives:    8
+   False Positives:   2
+   Detection Delay:   0.0 minutes
+   Precision Proxy:   80.00%
+   Recall Proxy:      100.00%
+
+💡 INTERPRETATION:
+   ✅ High precision - most detected anomalies are true incidents
+   ✅ Fast detection - incident caught within 1 minute
+======================================================================
+```
+
+### Run Evaluation
+
+```powershell
+python evaluate.py
+```
+
+Output saved to: `data/eval_report.json`
+
+---
+
+## 🔮 Future Work
+
+### 1. Azure OpenAI Integration (Planned)
+
+Replace templated explanations with AI-generated insights:
+
+```python
+# Current: Rule-based templates
+explanation = generate_incident_explanation(...)  # Local, deterministic
+
+# Future: Azure OpenAI
+explanation = await azure_openai_explain(...)     # AI-powered, contextual
+```
+
+**Fallback Strategy:**
+- Primary: Azure OpenAI for rich explanations
+- Fallback: Local templates (current implementation)
+- Graceful degradation if API unavailable
+
+### 2. Additional Enhancements
+
+| Feature | Status | Description |
+|---------|--------|-------------|
+| Azure OpenAI Explanations | 🔜 Planned | AI-powered root cause analysis |
+| Real-time Streaming | 🔜 Planned | Kafka/Event Hubs integration |
+| Multi-metric Correlation | 🔜 Planned | Cross-service dependency detection |
+| Alerting Integration | 🔜 Planned | PagerDuty, Slack, Teams |
+| Azure Monitor Integration | 🔜 Planned | Native Azure observability |
+| Isolation Forest | 🔜 Planned | ML-based detection option |
+
+### 3. Azure Architecture (Target)
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Azure Cloud                                       │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌──────────────┐    ┌──────────────┐    ┌───────────┐              │
+│  │ Azure Event  │───▶│ Azure        │───▶│ Azure     │              │
+│  │ Hubs         │    │ Functions    │    │ Cosmos DB │              │
+│  └──────────────┘    └──────────────┘    └───────────┘              │
+│                             │                                        │
+│                             ▼                                        │
+│                      ┌──────────────┐                                │
+│                      │ Azure OpenAI │                                │
+│                      │ (Explanations)│                                │
+│                      └──────────────┘                                │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 📁 Project Structure
+
+```
+ImagineCup/
 ├── ingest/
-│   ├── generate_logs.py       # Generate synthetic microservice logs
-│   ├── feature_build.py        # Build features and detect anomalies
-│   └── detector_mad.py         # MAD-based anomaly detection module
+│   ├── __init__.py
+│   ├── generate_logs.py      # Synthetic log generation
+│   ├── feature_build.py      # Feature engineering pipeline
+│   ├── detector_mad.py       # MAD anomaly detection
+│   └── culprit.py            # Culprit identification
 ├── backend_api/
-│   └── main.py                 # FastAPI REST API
+│   └── main.py               # FastAPI REST API
 ├── dashboard/
-│   └── app.py                  # Streamlit dashboard
-├── data/                       # Generated data files (created at runtime)
+│   └── app.py                # Streamlit dashboard
+├── data/                     # Generated at runtime
+├── evaluate.py               # Evaluation metrics
+├── run_demo.py               # One-command demo runner
 ├── requirements.txt
 └── README.md
 ```
 
-## Setup Instructions (Windows)
+---
 
-### 1. Activate Virtual Environment
+## 👥 Team
 
-```powershell
-.\.venv\Scripts\Activate.ps1
-```
+**Imagine Cup 2026**
 
-If you haven't created a virtual environment yet:
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-```
+---
 
-### 2. Install Dependencies
+## 📄 License
 
-```powershell
-pip install -r requirements.txt
-```
+MIT License - See [LICENSE](LICENSE) for details.
 
-### 3. Generate Synthetic Logs
+---
 
-```powershell
-python -m ingest.generate_logs
-```
+<div align="center">
 
-This creates `data/raw_logs.csv` with 10,000 log entries spanning 2 hours, including an injected incident in the payments service.
+**Built for Imagine Cup 2026** 🏆
 
-**Expected output:**
-- 10,000 rows of synthetic logs
-- Incident window: payments:/pay service (8 minutes of anomalous behavior)
-- Output: `data/raw_logs.csv`
+[Report Bug](https://github.com/amarnoorkaur/ImagineCup/issues) · [Request Feature](https://github.com/amarnoorkaur/ImagineCup/issues)
 
-### 4. Build Features and Detect Anomalies
-
-```powershell
-python -m ingest.feature_build
-```
-
-This processes raw logs into per-minute features and applies MAD anomaly detection.
-
-**Expected output:**
-- `data/features_1min.csv` - Aggregated per-minute metrics
-- `data/scored_1min.csv` - Features with anomaly scores and severity levels
-- Console summary showing anomaly counts by severity
-
-### 5. Run the API (Optional)
-
-```powershell
-uvicorn backend_api.main:app --reload
-```
-
-The API will be available at `http://localhost:8000`
-
-**Available endpoints:**
-- `GET /health` - Health check
-- `GET /metrics?service=&endpoint=&limit=200` - Query metrics
-- `GET /anomalies?service=&endpoint=&severity=&limit=50` - Query anomalies
-- `GET /incidents?limit=20` - Query grouped incidents
-
-API docs available at: `http://localhost:8000/docs`
-
-### 6. Run the Dashboard
-
-```powershell
-streamlit run dashboard/app.py
-```
-
-The dashboard will open automatically in your browser at `http://localhost:8501`
-
-## Demo Script for Imagine Cup
-
-Follow these steps to demonstrate the system:
-
-### Step 1: Generate Data
-```powershell
-python -m ingest.generate_logs
-```
-**Show**: Console output with incident details (payments:/pay service, 8-minute window)
-
-### Step 2: Run Feature Engineering & Anomaly Detection
-```powershell
-python -m ingest.feature_build
-```
-**Show**: 
-- Summary statistics
-- Anomaly counts by severity (Info/Warning/Critical)
-- Top affected services
-
-### Step 3: Launch Dashboard
-```powershell
-streamlit run dashboard/app.py
-```
-
-**Demo Flow:**
-1. **Overview**: Show the P95 latency chart - point out the anomaly spike
-2. **Filter by Service**: Select "payments" service to isolate the incident
-3. **Filter by Endpoint**: Select "/pay" endpoint
-4. **Anomaly Table**: Show detected anomalies with MAD z-scores and severity
-5. **Incident Summary**: Highlight the grouped incident window with:
-   - Start and end times
-   - Peak latency (5-20x normal)
-   - Elevated error rate (10-30%)
-   - Severity level (Warning/Critical)
-
-### Step 4: Show API Endpoints (Optional)
-
-Start the API:
-```powershell
-uvicorn backend_api.main:app --reload
-```
-
-**Demo in browser or with curl:**
-
-1. **Health check:**
-   ```
-   http://localhost:8000/health
-   ```
-
-2. **Query anomalies for payments service:**
-   ```
-   http://localhost:8000/anomalies?service=payments&endpoint=/pay
-   ```
-   **Show**: List of anomalies with timestamps, latency, error rates, and MAD scores
-
-3. **Query incidents:**
-   ```
-   http://localhost:8000/incidents?limit=10
-   ```
-   **Show**: Grouped incident windows with aggregated statistics
-
-4. **Interactive API docs:**
-   ```
-   http://localhost:8000/docs
-   ```
-   **Show**: Try out endpoints directly in the Swagger UI
-
-## Key Talking Points for Judges
-
-1. **No Training Required**: Uses MAD (Median Absolute Deviation), a robust statistical method that works immediately without historical training data
-
-2. **Real-time Detection**: Processes logs in 1-minute windows, suitable for production monitoring
-
-3. **Explainable**: MAD z-scores provide interpretable anomaly severity (threshold of 3.5 standard deviations)
-
-4. **Practical Implementation**: 
-   - Handles multiple services and endpoints
-   - Detects both latency spikes and error rate increases
-   - Groups consecutive anomalies into incidents
-   - Configurable thresholds and parameters
-
-5. **Scalable Architecture**: Modular design with separate components for ingestion, analysis, API, and visualization
-
-## Configuration
-
-### Log Generation Parameters
-Edit `ingest/generate_logs.py`:
-- `N_ROWS`: Number of log entries (default: 10,000)
-- `INCIDENT_START_MINUTE`: When to inject incident (default: 45)
-- `INCIDENT_DURATION_MINUTES`: Incident duration (default: 8)
-
-### Anomaly Detection Parameters
-Edit `ingest/feature_build.py` or call directly:
-- MAD threshold: 3.5 (modify in `detector_mad.add_mad_anomalies()`)
-- Time window: 1 minute (change bucket size in `build_per_minute_features()`)
-
-## Troubleshooting
-
-**Issue**: Dashboard shows "Data file not found"
-- **Solution**: Run steps 3 and 4 to generate the data files
-
-**Issue**: API returns 404 for data
-- **Solution**: Ensure `data/scored_1min.csv` exists (run step 4)
-
-**Issue**: Import errors
-- **Solution**: Make sure you're in the repository root and virtual environment is activated
-
-## Technical Details
-
-**Anomaly Detection Method**: MAD (Median Absolute Deviation)
-- Modified z-score: `0.6745 * (x - median) / MAD`
-- Threshold: 3.5 (approximately 3.5 standard deviations)
-- Groups by: (service, endpoint)
-- Metric: P95 latency
-
-**Severity Classification**:
-- **Info**: Normal behavior (|MAD z-score| ≤ 3.5)
-- **Warning**: Anomalous latency (|MAD z-score| > 3.5)
-- **Critical**: Anomalous latency + high error rate (≥5%)
-
-## Future Enhancements
-
-- [ ] Real-time log streaming with Kafka/RabbitMQ
-- [ ] Multiple detection algorithms (Isolation Forest, LSTM)
-- [ ] Alert notifications (email, Slack, PagerDuty)
-- [ ] Historical baseline comparison
-- [ ] Automated root cause analysis
-- [ ] Multi-metric correlation detection
-
-## License
-
-MIT License - Feel free to use for your projects!
+</div>

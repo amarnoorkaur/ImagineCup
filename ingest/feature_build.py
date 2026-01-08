@@ -111,8 +111,11 @@ def build_per_minute_features(df: pd.DataFrame) -> pd.DataFrame:
     # Calculate error rate
     features['error_rate'] = features['error_count'] / features['req_count']
     
-    # Convert bucket_ts to string for CSV compatibility
-    features['bucket_ts'] = features['bucket_ts'].dt.strftime('%Y-%m-%d %H:%M:%S')
+    # Sort by bucket_ts ascending for consistent ordering
+    features = features.sort_values('bucket_ts').reset_index(drop=True)
+    
+    # Convert bucket_ts to ISO string for CSV compatibility
+    features['bucket_ts'] = features['bucket_ts'].dt.strftime('%Y-%m-%dT%H:%M:%S')
     
     print(f"  Generated {len(features):,} feature rows")
     print(f"  Unique services: {features['service'].nunique()}")
@@ -168,8 +171,11 @@ def apply_mad_anomaly_detection(features_df: pd.DataFrame) -> pd.DataFrame:
         threshold=3.5
     )
     
-    # Convert bucket_ts back to string for output
-    scored_df['bucket_ts'] = scored_df['bucket_ts'].dt.strftime('%Y-%m-%d %H:%M:%S')
+    # Sort by bucket_ts ascending for consistent ordering
+    scored_df = scored_df.sort_values('bucket_ts').reset_index(drop=True)
+    
+    # Convert bucket_ts back to ISO string for output
+    scored_df['bucket_ts'] = scored_df['bucket_ts'].dt.strftime('%Y-%m-%dT%H:%M:%S')
     
     # Count anomalies
     anomaly_count = scored_df['is_anomaly'].sum()
@@ -188,11 +194,19 @@ def save_scored_output(df: pd.DataFrame, output_path: str) -> None:
         Scored DataFrame with all columns
     output_path : str
         Path to output CSV file
+    
+    Notes
+    -----
+    Output columns (in order):
+        bucket_ts, service, endpoint, req_count, error_count, error_rate,
+        avg_latency_ms, p95_latency_ms, mad_z, is_anomaly, severity
+    
+    Sorting: bucket_ts ascending (consistent with API/dashboard)
     """
     # Select and order columns for output
     output_columns = [
         'bucket_ts', 'service', 'endpoint', 
-        'req_count', 'error_rate', 'avg_latency_ms', 'p95_latency_ms',
+        'req_count', 'error_count', 'error_rate', 'avg_latency_ms', 'p95_latency_ms',
         'mad_z', 'is_anomaly', 'severity'
     ]
     
@@ -221,27 +235,40 @@ def print_summary(features_df: pd.DataFrame, scored_df: pd.DataFrame) -> None:
     print("FEATURE BUILD AND ANOMALY DETECTION SUMMARY")
     print("=" * 70)
     
-    print(f"\nFeature Rows: {len(features_df):,}")
-    print(f"Scored Rows: {len(scored_df):,}")
+    # Total rows
+    print(f"\nTotal Rows: {len(scored_df):,}")
     
-    print("\nAnomaly Count by Severity:")
-    severity_counts = scored_df['severity'].value_counts().sort_index()
-    for severity, count in severity_counts.items():
-        percentage = count / len(scored_df) * 100
-        print(f"  {severity:10s}: {count:6,} ({percentage:5.2f}%)")
+    # Time range
+    print(f"Time Range: {scored_df['bucket_ts'].min()} to {scored_df['bucket_ts'].max()}")
     
-    # Additional statistics
+    # Anomalies count
     total_anomalies = scored_df['is_anomaly'].sum()
-    print(f"\nTotal Anomalies: {total_anomalies:,}")
+    anomaly_pct = total_anomalies / len(scored_df) * 100 if len(scored_df) > 0 else 0
+    print(f"\nAnomalies Count: {total_anomalies:,} / {len(scored_df):,} ({anomaly_pct:.2f}%)")
+    
+    # Anomalies by severity
+    print("\nAnomalies by Severity:")
+    severity_order = ['Info', 'Warning', 'Critical']
+    severity_counts = scored_df['severity'].value_counts()
+    for severity in severity_order:
+        count = severity_counts.get(severity, 0)
+        percentage = count / len(scored_df) * 100 if len(scored_df) > 0 else 0
+        marker = "" if severity == "Info" else " [ANOMALY]"
+        print(f"  {severity:10s}: {count:6,} ({percentage:5.2f}%){marker}")
     
     if total_anomalies > 0:
         # Show top affected service/endpoint combinations
         anomalies_df = scored_df[scored_df['is_anomaly']]
         top_affected = anomalies_df.groupby(['service', 'endpoint']).size().sort_values(ascending=False).head(5)
         
-        print("\nTop 5 Affected Service/Endpoint Combinations:")
+        print("\nTop Affected Service/Endpoint Combinations:")
         for (service, endpoint), count in top_affected.items():
             print(f"  {service:15s} {endpoint:20s}: {count:3,} anomalies")
+    
+    # Output files
+    print(f"\nOutput Files:")
+    print(f"  Features: {FEATURES_OUTPUT}")
+    print(f"  Scored:   {SCORED_OUTPUT}")
     
     print("=" * 70)
 

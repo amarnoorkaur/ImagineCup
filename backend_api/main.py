@@ -14,17 +14,31 @@ Or with custom host/port:
 
 Dependencies:
 -------------
-    pip install fastapi uvicorn pandas
+    pip install fastapi uvicorn pandas pydantic
 """
 
 import os
-from typing import Optional, List, Dict, Any
+import logging
+from typing import Optional, List, Dict, Any, Union
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+from ingest.culprit import find_top_culprits
+from backend_api import telemetry_store
+from backend_api import realtime_processor
+
+
+# =============================================================================
+# LOGGING SETUP
+# =============================================================================
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 # =============================================================================
@@ -32,6 +46,7 @@ from fastapi.responses import JSONResponse
 # =============================================================================
 
 SCORED_DATA_PATH = "data/scored_1min.csv"
+REALTIME_LOOKBACK_MINUTES = 120  # Lookback window for real-time scoring
 
 app = FastAPI(
     title="Microservice Anomaly Detection API",
@@ -41,37 +56,78 @@ app = FastAPI(
 
 
 # =============================================================================
+# PYDANTIC MODELS FOR LIVE INGESTION
+# =============================================================================
+
+class LogEvent(BaseModel):
+    """Single log event from a microservice."""
+    timestamp: str = Field(..., description="ISO format timestamp (e.g., 2026-01-07T10:00:00)")
+    service: str = Field(..., description="Service name (e.g., 'auth', 'payments')")
+    endpoint: str = Field(..., description="Endpoint path (e.g., '/login', '/pay')")
+    status_code: int = Field(..., description="HTTP status code (e.g., 200, 500)")
+    latency_ms: float = Field(..., description="Response latency in milliseconds")
+    trace_id: Optional[str] = Field(None, description="Optional trace ID for distributed tracing")
+
+
+class LogEventBatch(BaseModel):
+    """Batch of log events for bulk ingestion."""
+    events: List[LogEvent] = Field(..., description="List of log events")
+
+
+# =============================================================================
 # DATA LOADING
 # =============================================================================
 
+# Expected columns in scored DataFrame
+SCORED_COLUMNS = [
+    "bucket_ts", "service", "endpoint", "req_count", "error_count",
+    "error_rate", "avg_latency_ms", "p95_latency_ms", "mad_z", "is_anomaly", "severity"
+]
+
+# Track current data mode
+_current_mode = "batch"
+
+
 def load_scored_data() -> pd.DataFrame:
     """
-    Load scored data from CSV file.
+    Load scored data from real-time store or fallback to CSV file.
+    
+    Priority:
+    1. Real-time in-memory data (if available and has rows)
+    2. Batch CSV file (data/scored_1min.csv)
+    3. Empty DataFrame with correct columns
     
     Returns
     -------
     pd.DataFrame
-        Scored data with anomaly detection results
-    
-    Raises
-    ------
-    FileNotFoundError
-        If the scored data file doesn't exist
+        Scored data with anomaly detection results.
+        bucket_ts column is always datetime type.
     """
-    if not os.path.exists(SCORED_DATA_PATH):
-        raise FileNotFoundError(
-            f"Scored data file not found at {SCORED_DATA_PATH}. "
-            "Please run the pipeline first:\n"
-            "  1. python -m ingest.generate_logs\n"
-            "  2. python -m ingest.feature_build"
-        )
+    global _current_mode
     
-    df = pd.read_csv(SCORED_DATA_PATH)
+    # Try real-time data first
+    realtime_df = realtime_processor.get_scored_df()
+    if len(realtime_df) > 0:
+        _current_mode = "live"
+        df = realtime_df.copy()
+        # Ensure bucket_ts is datetime
+        if df['bucket_ts'].dtype == 'object':
+            df['bucket_ts'] = pd.to_datetime(df['bucket_ts'])
+        logger.info(f"Using live data: {len(df)} rows")
+        return df
     
-    # Parse bucket_ts as datetime for sorting and filtering
-    df['bucket_ts'] = pd.to_datetime(df['bucket_ts'])
+    # Fallback to CSV file
+    if os.path.exists(SCORED_DATA_PATH):
+        _current_mode = "batch"
+        df = pd.read_csv(SCORED_DATA_PATH)
+        df['bucket_ts'] = pd.to_datetime(df['bucket_ts'])
+        logger.info(f"Using batch CSV data: {len(df)} rows")
+        return df
     
-    return df
+    # No data available - return empty DataFrame with correct columns
+    _current_mode = "batch"
+    logger.warning("No scored data available (neither live nor batch)")
+    return pd.DataFrame(columns=SCORED_COLUMNS)
 
 
 def get_data() -> pd.DataFrame:
@@ -81,27 +137,15 @@ def get_data() -> pd.DataFrame:
     Returns
     -------
     pd.DataFrame
-        Scored data
+        Scored data (may be empty if no data available)
     
     Raises
     ------
     HTTPException
-        If data cannot be loaded
+        If data cannot be loaded due to an error
     """
     try:
         return load_scored_data()
-    except FileNotFoundError as e:
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "error": "Data not found",
-                "message": str(e),
-                "next_steps": [
-                    "Run: python -m ingest.generate_logs",
-                    "Run: python -m ingest.feature_build"
-                ]
-            }
-        )
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -127,6 +171,56 @@ def health_check() -> Dict[str, str]:
         Status information
     """
     return {"status": "ok"}
+
+
+@app.get("/stats")
+def get_stats() -> Dict[str, Any]:
+    """
+    Get overall statistics about the scored data.
+    
+    Returns
+    -------
+    Dict[str, Any]
+        Dictionary containing:
+        - mode: "live" or "batch" indicating data source
+        - total_points: Total number of data points
+        - total_anomalies: Number of anomalies detected
+        - by_severity: Breakdown by severity level
+        - latest_bucket_ts: Most recent timestamp or null
+    """
+    df = get_data()
+    
+    if len(df) == 0:
+        return {
+            "mode": _current_mode,
+            "total_points": 0,
+            "total_anomalies": 0,
+            "by_severity": {"Info": 0, "Warning": 0, "Critical": 0},
+            "latest_bucket_ts": None
+        }
+    
+    # Count by severity
+    severity_counts = df['severity'].value_counts().to_dict()
+    by_severity = {
+        "Info": severity_counts.get("Info", 0),
+        "Warning": severity_counts.get("Warning", 0),
+        "Critical": severity_counts.get("Critical", 0)
+    }
+    
+    # Get latest timestamp
+    latest_ts = df['bucket_ts'].max()
+    if pd.notna(latest_ts):
+        latest_ts_str = latest_ts.strftime('%Y-%m-%dT%H:%M:%S')
+    else:
+        latest_ts_str = None
+    
+    return {
+        "mode": _current_mode,
+        "total_points": len(df),
+        "total_anomalies": int(df['is_anomaly'].sum()),
+        "by_severity": by_severity,
+        "latest_bucket_ts": latest_ts_str
+    }
 
 
 @app.get("/metrics")
@@ -376,6 +470,386 @@ def get_incidents(
     }
 
 
+@app.get("/culprit")
+def get_culprit(
+    minutes: int = Query(15, ge=1, le=1440, description="Lookback window in minutes"),
+    top_k: int = Query(3, ge=1, le=20, description="Number of top culprits to return")
+) -> Dict[str, Any]:
+    """
+    Get the top culprit service/endpoint combinations from recent anomalies.
+    
+    This endpoint analyzes recent anomalies and ranks service/endpoint combinations
+    by severity to identify the most likely root causes of issues.
+    
+    Parameters
+    ----------
+    minutes : int
+        Number of minutes to look back (default: 15, max: 1440 = 24 hours)
+    top_k : int
+        Number of top culprits to return (default: 3, max: 20)
+    
+    Returns
+    -------
+    Dict[str, Any]
+        Dictionary containing:
+        - window_minutes: The lookback window used
+        - window_start: ISO timestamp of window start
+        - window_end: ISO timestamp of window end
+        - total_anomalies: Total anomaly rows in window
+        - culprit: Top culprit details (or null if no anomalies)
+        - top: List of top_k culprits ranked by severity
+    
+    Ranking Logic
+    -------------
+    Culprits are ranked by (in priority order):
+    1. peak_abs_mad (descending) - Highest absolute MAD z-score
+    2. peak_severity (descending) - Critical > Warning > Info
+    3. peak_error_rate (descending) - Highest error rate
+    """
+    df = get_data()
+    
+    # Call the culprit finder
+    result = find_top_culprits(
+        df_scored=df,
+        minutes=minutes,
+        now_ts=None,  # Use latest timestamp in data
+        top_k=top_k
+    )
+    
+    return result
+
+
+@app.get("/explain_incident")
+def explain_incident(
+    service: str = Query(..., description="Service name (required)"),
+    endpoint: str = Query(..., description="Endpoint path (required)"),
+    start_ts: str = Query(..., description="Start timestamp in ISO format (required)"),
+    end_ts: str = Query(..., description="End timestamp in ISO format (required)")
+) -> Dict[str, Any]:
+    """
+    Get a deterministic explanation for an incident.
+    
+    This endpoint analyzes the specified incident window and generates
+    a templated explanation based on the observed metrics and severity.
+    No external API calls are made - all explanations are rule-based.
+    
+    Parameters
+    ----------
+    service : str
+        Service name (required)
+    endpoint : str
+        Endpoint path (required)
+    start_ts : str
+        Start timestamp in ISO format (required)
+    end_ts : str
+        End timestamp in ISO format (required)
+    
+    Returns
+    -------
+    Dict[str, Any]
+        Incident explanation containing:
+        - service, endpoint, start_ts, end_ts
+        - summary: Brief description of the incident
+        - why_flagged: Reasons the anomaly was detected
+        - impact: Potential user/business impact
+        - likely_causes: Possible root causes
+        - recommended_actions: Suggested remediation steps
+        - confidence: Low, Medium, or High
+        - metrics: Computed metric values
+    """
+    df = get_data()
+    
+    # Parse timestamps
+    try:
+        start_dt = pd.to_datetime(start_ts)
+        end_dt = pd.to_datetime(end_ts)
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "Invalid timestamp format",
+                "message": f"Could not parse timestamps: {e}",
+                "expected_format": "ISO format, e.g., 2026-01-06T10:45:00"
+            }
+        )
+    
+    # Filter to the specified service, endpoint, and time window
+    mask = (
+        (df['service'] == service) &
+        (df['endpoint'] == endpoint) &
+        (df['bucket_ts'] >= start_dt) &
+        (df['bucket_ts'] <= end_dt)
+    )
+    filtered = df[mask]
+    
+    if len(filtered) == 0:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "No data found",
+                "message": f"No records found for {service}:{endpoint} between {start_ts} and {end_ts}",
+                "suggestion": "Check that the service, endpoint, and time range are correct"
+            }
+        )
+    
+    # Compute metrics
+    has_error_rate = 'error_rate' in filtered.columns
+    
+    peak_p95_latency_ms = float(filtered['p95_latency_ms'].max())
+    peak_abs_mad_z = float(filtered['mad_z'].abs().max())
+    avg_abs_mad_z = float(filtered['mad_z'].abs().mean())
+    peak_error_rate = float(filtered['error_rate'].max()) if has_error_rate else 0.0
+    avg_error_rate = float(filtered['error_rate'].mean()) if has_error_rate else 0.0
+    count_points = len(filtered)
+    anomaly_points = int(filtered['is_anomaly'].sum())
+    
+    # Determine peak severity
+    severity_order = {"Info": 0, "Warning": 1, "Critical": 2}
+    severity_ranks = filtered['severity'].map(severity_order)
+    peak_severity_rank = int(severity_ranks.max())
+    peak_severity = [k for k, v in severity_order.items() if v == peak_severity_rank][0]
+    
+    # Build metrics dict
+    metrics = {
+        "peak_p95_latency_ms": round(peak_p95_latency_ms, 2),
+        "peak_abs_mad_z": round(peak_abs_mad_z, 3),
+        "avg_abs_mad_z": round(avg_abs_mad_z, 3),
+        "peak_error_rate": round(peak_error_rate, 4),
+        "avg_error_rate": round(avg_error_rate, 4),
+        "count_points": count_points,
+        "anomaly_points": anomaly_points,
+        "peak_severity": peak_severity
+    }
+    
+    # Determine confidence based on data quality
+    if anomaly_points >= 5 and peak_abs_mad_z > 5.0:
+        confidence = "High"
+    elif anomaly_points >= 3 and peak_abs_mad_z > 3.5:
+        confidence = "Medium"
+    else:
+        confidence = "Low"
+    
+    # Determine if error rate is elevated (> 5%)
+    error_elevated = peak_error_rate >= 0.05
+    
+    # Generate templated explanations based on severity and error rate
+    # Summary
+    if peak_severity == "Critical":
+        summary = (
+            f"Critical incident detected on {service}:{endpoint}. "
+            f"Peak latency reached {peak_p95_latency_ms:.0f}ms (MAD z-score: {peak_abs_mad_z:.1f}) "
+            f"with {anomaly_points} anomalous data points over {count_points} minutes."
+        )
+    elif peak_severity == "Warning":
+        summary = (
+            f"Warning-level anomaly detected on {service}:{endpoint}. "
+            f"Elevated latency of {peak_p95_latency_ms:.0f}ms observed (MAD z-score: {peak_abs_mad_z:.1f})."
+        )
+    else:
+        summary = (
+            f"Minor deviation detected on {service}:{endpoint}. "
+            f"Metrics showed slight elevation but remained within acceptable bounds."
+        )
+    
+    # Why flagged
+    why_flagged = []
+    why_flagged.append(f"P95 latency spiked to {peak_p95_latency_ms:.0f}ms")
+    why_flagged.append(f"MAD z-score of {peak_abs_mad_z:.1f} exceeded threshold of 3.5")
+    if error_elevated:
+        why_flagged.append(f"Error rate elevated to {peak_error_rate:.1%} (threshold: 5%)")
+    if anomaly_points >= 3:
+        why_flagged.append(f"Sustained anomaly over {anomaly_points} consecutive data points")
+    
+    # Impact
+    impact = []
+    if peak_severity == "Critical":
+        impact.append("Users likely experiencing failed requests or timeouts")
+        impact.append("Service reliability SLO may be breached")
+        if error_elevated:
+            impact.append(f"Approximately {peak_error_rate:.1%} of requests are failing")
+    elif peak_severity == "Warning":
+        impact.append("Users may experience degraded performance")
+        impact.append("Response times elevated but service is functional")
+    else:
+        impact.append("Minimal user impact expected")
+        impact.append("Performance slightly degraded but within tolerance")
+    
+    if peak_p95_latency_ms > 1000:
+        impact.append("Latency exceeds 1 second, causing poor user experience")
+    
+    # Likely causes (templated based on patterns)
+    likely_causes = []
+    
+    if error_elevated and peak_p95_latency_ms > 500:
+        likely_causes.append("Downstream service failure or timeout")
+        likely_causes.append("Database connection pool exhaustion")
+        likely_causes.append("External API dependency failure")
+    elif peak_p95_latency_ms > 1000:
+        likely_causes.append("Resource contention (CPU/memory pressure)")
+        likely_causes.append("Database query performance degradation")
+        likely_causes.append("Network latency spike")
+    elif error_elevated:
+        likely_causes.append("Application exception or bug")
+        likely_causes.append("Invalid input data causing failures")
+        likely_causes.append("Authentication/authorization failures")
+    else:
+        likely_causes.append("Increased traffic load")
+        likely_causes.append("Garbage collection pauses")
+        likely_causes.append("Cold start or cache miss")
+    
+    # Add service-specific hints based on endpoint patterns
+    if "pay" in endpoint.lower() or "checkout" in endpoint.lower():
+        likely_causes.append("Payment gateway latency or failure")
+    elif "auth" in endpoint.lower() or "login" in endpoint.lower():
+        likely_causes.append("Identity provider slowdown")
+    elif "search" in endpoint.lower():
+        likely_causes.append("Search index performance issue")
+    
+    # Recommended actions
+    recommended_actions = []
+    
+    if peak_severity == "Critical":
+        recommended_actions.append("Immediately check service health and logs")
+        recommended_actions.append("Verify downstream dependencies are healthy")
+        recommended_actions.append("Consider enabling circuit breaker if available")
+        if error_elevated:
+            recommended_actions.append("Check error logs for exception stack traces")
+            recommended_actions.append("Verify database connectivity and pool status")
+    
+    if peak_p95_latency_ms > 1000:
+        recommended_actions.append("Review recent deployments for performance regressions")
+        recommended_actions.append("Check resource utilization (CPU, memory, connections)")
+    
+    recommended_actions.append("Review metrics dashboard for correlated issues")
+    recommended_actions.append("Check if issue correlates with traffic spike")
+    
+    if len(recommended_actions) < 3:
+        recommended_actions.append("Monitor for recurrence")
+        recommended_actions.append("Consider adding alerting for this endpoint")
+    
+    # Build response
+    return {
+        "service": service,
+        "endpoint": endpoint,
+        "start_ts": start_dt.isoformat(),
+        "end_ts": end_dt.isoformat(),
+        "summary": summary,
+        "why_flagged": why_flagged,
+        "impact": impact,
+        "likely_causes": likely_causes[:5],  # Limit to top 5
+        "recommended_actions": recommended_actions[:5],  # Limit to top 5
+        "confidence": confidence,
+        "metrics": metrics
+    }
+
+
+# =============================================================================
+# LIVE INGESTION ENDPOINT
+# =============================================================================
+
+@app.post("/ingest")
+def ingest_events(
+    payload: Union[LogEvent, LogEventBatch]
+) -> Dict[str, Any]:
+    """
+    Ingest live log events into the telemetry store.
+
+    This endpoint accepts either a single LogEvent or a batch of events.
+    Events are stored in memory for real-time analysis.
+
+    Parameters
+    ----------
+    payload : Union[LogEvent, LogEventBatch]
+        Either a single LogEvent object or a LogEventBatch containing
+        a list of events.
+
+    Returns
+    -------
+    Dict[str, Any]
+        Dictionary containing:
+        - accepted: Number of events successfully stored
+        - retention_minutes: Current retention window
+
+    Example Request (single event):
+    -------------------------------
+    POST /ingest
+    {
+        "timestamp": "2026-01-07T10:00:00",
+        "service": "auth",
+        "endpoint": "/login",
+        "status_code": 200,
+        "latency_ms": 45.2,
+        "trace_id": "abc123"
+    }
+
+    Example Request (batch):
+    ------------------------
+    POST /ingest
+    {
+        "events": [
+            {"timestamp": "2026-01-07T10:00:00", "service": "auth", ...},
+            {"timestamp": "2026-01-07T10:00:01", "service": "payments", ...}
+        ]
+    }
+
+    Example Response:
+    -----------------
+    {
+        "accepted": 2,
+        "retention_minutes": 180,
+        "scored_rows": 10
+    }
+    """
+    # Determine if single event or batch
+    if isinstance(payload, LogEvent):
+        events = [payload.model_dump()]
+    else:
+        events = [e.model_dump() for e in payload.events]
+
+    # Store events
+    accepted_count = telemetry_store.add_events(events)
+
+    # Prune old events
+    pruned_count = telemetry_store.prune_older_than(telemetry_store.RETENTION_MINUTES)
+
+    # Rebuild real-time scores from all events
+    all_events = telemetry_store.get_all_events()
+    scored_df = realtime_processor.rebuild_scores(all_events, lookback_minutes=REALTIME_LOOKBACK_MINUTES)
+    realtime_processor.set_scored_df(scored_df)
+    scored_rows = len(scored_df)
+
+    # Log the ingestion
+    logger.info(f"Ingested {accepted_count} events (pruned {pruned_count} old, scored {scored_rows} rows)")
+
+    return {
+        "accepted": accepted_count,
+        "retention_minutes": telemetry_store.RETENTION_MINUTES,
+        "scored_rows": scored_rows
+    }
+
+
+@app.get("/ingest/stats")
+def get_ingest_stats() -> Dict[str, Any]:
+    """
+    Get statistics about the live telemetry store.
+
+    Returns
+    -------
+    Dict[str, Any]
+        Dictionary containing:
+        - count: Number of events in store
+        - max_capacity: Maximum events allowed
+        - oldest_ts: Oldest event timestamp
+        - newest_ts: Newest event timestamp
+        - retention_minutes: Retention window setting
+        - realtime_stats: Real-time scoring statistics
+    """
+    stats = telemetry_store.get_store_stats()
+    stats["retention_minutes"] = telemetry_store.RETENTION_MINUTES
+    stats["realtime_stats"] = realtime_processor.get_realtime_stats()
+    return stats
+
+
 # =============================================================================
 # STARTUP EVENT
 # =============================================================================
@@ -401,6 +875,10 @@ async def startup_event():
     except Exception as e:
         print(f"✗ Error loading data: {e}")
     
+    print("-" * 70)
+    print("Live ingestion endpoint: POST /ingest")
+    print(f"  Retention: {telemetry_store.RETENTION_MINUTES} minutes")
+    print("  Stats: GET /ingest/stats")
     print("=" * 70)
 
 
